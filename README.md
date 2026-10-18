@@ -113,7 +113,7 @@ Required, in order:
 3. `GET https://b2c.api.spdigital.sg/jarvis/v4/charts/{premise_id}`
 4. `GET https://b2c.api.spdigital.sg/jarvis/v3/smrd-uportal/{premise_id}`
 5. `GET https://b2c.api.spdigital.sg/jarvis/v3/ppms/balance/{premise_id}` only if prepaid exists
-6. `POST https://b2c.api.spdigital.sg/jarvis/v3/ami/charts` when `ami_elec` (`grouped_by` `day` then `month`)
+6. `POST https://b2c.api.spdigital.sg/jarvis/v3/ami/charts` when `ami_elec` (`grouped_by` `day` then `month`). Jarvis answers it with a 500 now and then; a failed read stands on the last good answer of the same feed for up to 6 hours, so one bad poll does not drop **Electricity today** and **Electricity last 30 min** to unknown
 7. `GET https://b2c.api.spdigital.sg/njord/v3/history?account_numbers={account}` every `type=bill` row, ordered by the instant it was issued; the newest one is the **Last bill**. PDF URLs are not stored
 8. `GET https://b2c.api.spdigital.sg/njord/v4/payables` (integer cents)
 9. `GET https://b2c.api.spdigital.sg/jarvis/v5/greengoals/targets`

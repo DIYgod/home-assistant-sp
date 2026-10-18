@@ -215,6 +215,10 @@ class UsageReadings:
     ppms_updated_at: str | None = None
     ami_hourly: tuple[PeriodReading, ...] = ()
     ami_daily: tuple[PeriodReading, ...] = ()
+    # An AMI read failed and no earlier answer of that feed could stand in, so
+    # the AMI series above is missing what that feed holds. The sensors show
+    # what there is; the statistics import waits for a poll that read it.
+    ami_read_failed: bool = False
     bills: tuple[BillInfo, ...] = ()
     amount_due: PayableInfo | None = None
     meter_registers: tuple[MeterRegister, ...] = ()
