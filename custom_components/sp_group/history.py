@@ -6,9 +6,9 @@ are folded to clock hours, and bills collapse to one point per calendar month.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Protocol
 
 from .const import DOMAIN
@@ -47,6 +47,53 @@ def unimported[Started: HasStart](
 class CumulativePoint:
     start: datetime
     cumulative: float
+
+
+def continued(
+    points: Sequence[CumulativePoint],
+    written: Mapping[datetime, float],
+    reopen: timedelta,
+) -> list[CumulativePoint]:
+    """The points to write so a cumulative series keeps one running sum.
+
+    ``written`` is the sum the caller last wrote at each start of this series.
+    It starts empty on every Home Assistant start, and the first import after
+    one is the whole series as computed, which is what ``unimported`` sends.
+
+    After that, two things differ from cutting at the newest start written.
+
+    The points from ``reopen`` before the newest start written are sent again.
+    The half-hour feed publishes a slot hours after it ends, and by then the
+    next day's daily point has already moved the newest start past it. Cut at
+    the newest start, the slots of each evening never reached the recorder
+    until a restart re-sent everything, and the first hour written after them
+    carried their whole sum. The recorder keys a row by its start, so a row
+    sent again is replaced, not doubled.
+
+    And every point sent is shifted so the newest point at or before the cut,
+    which this series wrote before, keeps the sum it was written with. A poll
+    sums its series from the start of the window it read, and that start moves:
+    on the 1st a month of daily points leaves the window, and every sum after
+    it falls by that month's usage. Unshifted, the first hour written after
+    the move read as a month of negative usage.
+    """
+    if not written:
+        return list(points)
+    cut = max(written) - reopen
+    anchor: CumulativePoint | None = None
+    for point in points:
+        if (
+            point.start <= cut
+            and point.start in written
+            and (anchor is None or point.start > anchor.start)
+        ):
+            anchor = point
+    offset = 0.0 if anchor is None else written[anchor.start] - anchor.cumulative
+    return [
+        CumulativePoint(start=point.start, cumulative=point.cumulative + offset)
+        for point in points
+        if point.start > cut
+    ]
 
 
 def cost_points(

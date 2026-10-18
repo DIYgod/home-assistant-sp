@@ -184,6 +184,13 @@ MAX_FCU_STATUS_READS = 8
 
 UPDATE_INTERVAL = timedelta(minutes=30)
 
+# How far before the newest start a cumulative statistic has written its rows
+# are sent again on each import (history.continued). The half-hour feed lags
+# the meter by six to nine hours and publishes in batches, so a slot can land
+# behind a start already written; two days keeps a late batch, or a feed that
+# was down for a day, inside the rows a poll rewrites.
+STATISTICS_REOPEN = timedelta(days=2)
+
 # A poll that succeeds this slowly still refreshed every sensor, so the
 # entities look healthy and nothing else records the cost. The required reads
 # time out after HTTP_TIMEOUT_SECONDS and the optional ones after

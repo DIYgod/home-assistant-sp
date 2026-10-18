@@ -5,10 +5,9 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Sequence
 from contextlib import suppress
 from datetime import datetime
-from typing import TypeVar
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import CONF_USERNAME
@@ -33,6 +32,7 @@ from .const import (
     STATISTIC_NAME_ELECTRICITY,
     STATISTIC_NAME_ELECTRICITY_COST,
     STATISTIC_NAME_GAS,
+    STATISTICS_REOPEN,
     UNIT_KWH,
     UNIT_SGD,
     UPDATE_INTERVAL,
@@ -41,7 +41,7 @@ from .const import (
 )
 from .history import (
     CumulativePoint,
-    HasStart,
+    continued,
     cost_points,
     cumulative_points,
     external_statistic_id,
@@ -57,19 +57,9 @@ from .models import PeriodReading, UsageReadings
 
 _LOGGER = logging.getLogger(__name__)
 
-_PointT = TypeVar("_PointT", bound=HasStart)
-
 # One series to import: the sensor key, the periods behind it, and the
 # recorder metadata the row needs.
 _ImportedSeries = tuple[str, tuple[PeriodReading, ...], str, str | None, str]
-
-
-def _cumulative(point: CumulativePoint) -> float:
-    return point.cumulative
-
-
-def _amount(point: PeriodReading) -> float:
-    return point.amount
 
 
 class SpGroupCoordinator(DataUpdateCoordinator[UsageReadings]):
@@ -95,7 +85,9 @@ class SpGroupCoordinator(DataUpdateCoordinator[UsageReadings]):
         self._stats_stopped = False
         self._imported_price: float | None = None
         self._imported_premise: str | None = None
-        self._imported_points: dict[str, datetime] = {}
+        # What each statistic last wrote, by start: the sums the next import
+        # continues from (history.continued).
+        self._written_rows: dict[str, dict[datetime, float]] = {}
         self._spec_cache = UsageViewCache()
         self._now = self.client.clock.now()
 
@@ -259,40 +251,75 @@ class SpGroupCoordinator(DataUpdateCoordinator[UsageReadings]):
                     "failed to import billed statistics for %s", self.entry.title
                 )
 
-    def _imported_through(self, premise_id: str) -> dict[str, datetime]:
-        """The newest start already written per statistic id for this premise.
+    def _written(self, premise_id: str) -> dict[str, dict[datetime, float]]:
+        """What each statistic id of this premise last wrote, by start.
 
         Dropped when the premise changes so a re-auth against another account
-        cannot leave the previous one's keys behind.
+        cannot leave the previous one's rows behind.
         """
         if self._imported_premise != premise_id:
             self._imported_premise = premise_id
-            self._imported_points = {}
-        return self._imported_points
+            self._written_rows = {}
+        return self._written_rows
 
-    def _add_external_statistics(
+    def _write_statistics(
         self,
         premise_id: str,
         statistic_id: str,
         metadata: dict[str, object],
-        points: Sequence[_PointT],
-        value: Callable[[_PointT], float],
+        rows: Sequence[tuple[datetime, float]],
     ) -> None:
-        """Write the points the recorder has not seen yet, then remember the last."""
+        """Send rows to the recorder, then remember the sum each start now holds."""
         from homeassistant.components.recorder.statistics import (
             async_add_external_statistics,
         )
 
-        imported = self._imported_through(premise_id)
-        fresh = unimported(points, imported.get(statistic_id))
-        if not fresh:
+        if not rows:
             return
         stats = [
-            {"start": point.start, "state": value(point), "sum": value(point)}
-            for point in fresh
+            {"start": start, "state": value, "sum": value} for start, value in rows
         ]
         async_add_external_statistics(self.hass, metadata, stats)
-        imported[statistic_id] = fresh[-1].start
+        self._written(premise_id).setdefault(statistic_id, {}).update(rows)
+
+    def _add_cumulative_statistics(
+        self,
+        premise_id: str,
+        statistic_id: str,
+        metadata: dict[str, object],
+        points: Sequence[CumulativePoint],
+    ) -> None:
+        """Write a running-sum series so it continues the rows already written."""
+        written = self._written(premise_id).setdefault(statistic_id, {})
+        if points:
+            # A start before the series' first point can no longer anchor it.
+            oldest = min(point.start for point in points)
+            for start in [start for start in written if start < oldest]:
+                del written[start]
+        fresh = continued(points, written, STATISTICS_REOPEN)
+        self._write_statistics(
+            premise_id,
+            statistic_id,
+            metadata,
+            [(point.start, point.cumulative) for point in fresh],
+        )
+
+    def _add_bill_statistics(
+        self,
+        premise_id: str,
+        statistic_id: str,
+        metadata: dict[str, object],
+        points: Sequence[PeriodReading],
+    ) -> None:
+        """Bills are one amount per month, not a running sum: send the new ones."""
+        written = self._written(premise_id).get(statistic_id)
+        fresh = unimported(points, max(written) if written else None)
+        self._write_statistics(
+            premise_id,
+            statistic_id,
+            metadata,
+            [(point.start, point.amount) for point in fresh],
+        )
 
     async def _async_import_billed_history(self, usage: UsageReadings) -> None:
         from homeassistant.components.recorder.models.statistics import (
@@ -313,13 +340,24 @@ class SpGroupCoordinator(DataUpdateCoordinator[UsageReadings]):
             }
 
         price = self.electricity_price
-        if usage.electricity is not None:
+        # A poll whose AMI read failed with no earlier answer to stand on has a
+        # hole where that feed goes: the series falls back to the daily or the
+        # billed periods, and writing it would put a day's or a month's total on
+        # rows that hold one hour. The next poll that reads the feed writes them.
+        electricity_skipped = usage.electricity is not None and usage.ami_read_failed
+        if electricity_skipped:
+            _LOGGER.debug(
+                "an AMI read failed for %s; the electricity statistics wait for "
+                "the next poll",
+                self.entry.title,
+            )
+        elif usage.electricity is not None:
             periods = self._spec_cache.view(usage, self.now).graph
             points = cumulative_points(
                 periods if periods else usage.electricity.periods
             )
             if points:
-                self._add_external_statistics(
+                self._add_cumulative_statistics(
                     usage.premise_id,
                     external_statistic_id(usage.premise_id, SENSOR_KEY_ELECTRICITY),
                     metadata(
@@ -329,7 +367,6 @@ class SpGroupCoordinator(DataUpdateCoordinator[UsageReadings]):
                         "energy",
                     ),
                     points,
-                    _cumulative,
                 )
                 cost_id = external_statistic_id(
                     usage.premise_id, STATISTIC_KEY_ELECTRICITY_COST
@@ -337,13 +374,13 @@ class SpGroupCoordinator(DataUpdateCoordinator[UsageReadings]):
                 if price != self._imported_price:
                     # The cost series is a cumulative product of the price, so a
                     # new price has to reach the points already written. The
-                    # recorder overwrites a row it already holds, so dropping
-                    # the watermark re-sends the whole series at the new price;
-                    # keeping it left the loaded window on the old price and
-                    # repriced only what came after.
-                    self._imported_through(usage.premise_id).pop(cost_id, None)
+                    # recorder overwrites a row it already holds, so forgetting
+                    # what was written re-sends the whole series at the new
+                    # price; keeping it left the loaded window on the old price
+                    # and repriced only what came after.
+                    self._written(usage.premise_id).pop(cost_id, None)
                 if price is not None:
-                    self._add_external_statistics(
+                    self._add_cumulative_statistics(
                         usage.premise_id,
                         cost_id,
                         metadata(
@@ -353,12 +390,11 @@ class SpGroupCoordinator(DataUpdateCoordinator[UsageReadings]):
                             None,
                         ),
                         cost_points(points, price),
-                        _cumulative,
                     )
         if usage.gas is not None:
             points = cumulative_points(usage.gas.periods)
             if points:
-                self._add_external_statistics(
+                self._add_cumulative_statistics(
                     usage.premise_id,
                     external_statistic_id(usage.premise_id, SENSOR_KEY_GAS),
                     metadata(
@@ -368,15 +404,15 @@ class SpGroupCoordinator(DataUpdateCoordinator[UsageReadings]):
                         "energy" if usage.gas.unit == UNIT_KWH else "volume",
                     ),
                     points,
-                    _cumulative,
                 )
         bill_points = monthly_bill_points(usage.bills)
         if bill_points:
-            self._add_external_statistics(
+            self._add_bill_statistics(
                 usage.premise_id,
                 external_statistic_id(usage.premise_id, SENSOR_KEY_LAST_BILL),
                 metadata(SENSOR_KEY_LAST_BILL, STATISTIC_NAME_BILL, UNIT_SGD, None),
                 bill_points,
-                _amount,
             )
-        self._imported_price = self.electricity_price
+        if not electricity_skipped:
+            # A skipped import has not written the cost series at this price.
+            self._imported_price = self.electricity_price
