@@ -43,6 +43,13 @@ AMI_GROUPED_BY_DAILY = "month"
 AMI_HALF_HOUR_DAYS = 31
 AMI_DAILY_MONTHS = 13
 AMI_DATE_FORMAT = "%Y%m%d%H%M%S"
+# How long a failed AMI read may stand on the slots the previous good read of
+# the same feed returned. Jarvis answers the chart call with a 500 now and then
+# (four polls in a day on one account) and the next poll reads fine; without the
+# stand-in each of those polls drops today's total and the last slot to
+# unknown and moves the cumulative sensor onto another series. Past this age
+# the outage is real and the sensors say so.
+AMI_FALLBACK_MAX_AGE = timedelta(hours=6)
 
 AUTH0_CLIENT_ID = "z1tl6I1V6HI201ule9tmSALb97hw8Biu"
 AUTH0_AUDIENCE = "https://profile.up.spdigital.sg/"
@@ -176,6 +183,13 @@ LOGIN_RETRY_COOLDOWN_SECONDS = 60
 MAX_FCU_STATUS_READS = 8
 
 UPDATE_INTERVAL = timedelta(minutes=30)
+
+# How far before the newest start a cumulative statistic has written its rows
+# are sent again on each import (history.continued). The half-hour feed lags
+# the meter by six to nine hours and publishes in batches, so a slot can land
+# behind a start already written; two days keeps a late batch, or a feed that
+# was down for a day, inside the rows a poll rewrites.
+STATISTICS_REOPEN = timedelta(days=2)
 
 # A poll that succeeds this slowly still refreshed every sensor, so the
 # entities look healthy and nothing else records the cost. The required reads

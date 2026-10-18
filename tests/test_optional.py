@@ -464,6 +464,147 @@ def test_a_graphql_read_that_answers_200_with_errors_says_so(
     assert "Unauthorized" in caplog.text
 
 
+FROSTY_REFUSED = HttpResponse(
+    200, json.dumps({"data": None, "errors": [{"message": "Unauthorized"}]}).encode()
+)
+EVA_DENIED = HttpResponse(403, b'{"error":"scope_not_found"}')
+
+
+def _warnings_about(caplog: pytest.LogCaptureFixture, text: str) -> int:
+    return sum(
+        1
+        for record in caplog.records
+        if record.levelno == logging.WARNING and text in record.getMessage()
+    )
+
+
+def _debug_lines_about(caplog: pytest.LogCaptureFixture, text: str) -> int:
+    return sum(
+        1
+        for record in caplog.records
+        if record.levelno == logging.DEBUG and text in record.getMessage()
+    )
+
+
+def test_a_premise_without_a_tengah_coil_warns_once_not_every_poll(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Frosty refuses getPairedFCUs with "Unauthorized" for a premise with no coil.
+
+    That answer is the account's steady state: warned on every poll it filled
+    the log with the same line every 30 minutes. The first one still warns,
+    the repeats go to debug.
+    """
+    transport = FixtureTransport(responses={"/frosty/graphql": FROSTY_REFUSED})
+    client = fixture_client(transport)
+    with caplog.at_level(logging.DEBUG, logger="custom_components.sp_group"):
+        for _ in range(3):
+            assert client.fetch_usage().fcus == ()
+
+    assert _warnings_about(caplog, "/frosty/graphql returned GraphQL errors") == 1
+    assert _debug_lines_about(caplog, "/frosty/graphql returned GraphQL errors") == 2
+
+
+def test_a_graphql_refusal_warns_again_after_the_read_succeeded(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Refused, answered, refused: the second refusal is news, not a repeat."""
+    transport = FixtureTransport(responses={"/frosty/graphql": FROSTY_REFUSED})
+    client = fixture_client(transport)
+    with caplog.at_level(logging.WARNING):
+        client.fetch_usage()
+        transport.responses["/frosty/graphql"] = HttpResponse(
+            200, b'{"data": {"getPairedFCUs": []}}'
+        )
+        client.fetch_usage()
+        transport.responses["/frosty/graphql"] = FROSTY_REFUSED
+        client.fetch_usage()
+
+    assert _warnings_about(caplog, "/frosty/graphql returned GraphQL errors") == 2
+
+
+def test_a_graphql_refusal_with_new_wording_warns_again(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A different message is a different refusal, so it is not filed as a repeat."""
+    transport = FixtureTransport(responses={"/frosty/graphql": FROSTY_REFUSED})
+    client = fixture_client(transport)
+    with caplog.at_level(logging.WARNING):
+        client.fetch_usage()
+        transport.responses["/frosty/graphql"] = HttpResponse(
+            200, json.dumps({"errors": [{"message": "Forbidden"}]}).encode()
+        )
+        client.fetch_usage()
+
+    assert _warnings_about(caplog, "GraphQL errors: Unauthorized") == 1
+    assert _warnings_about(caplog, "GraphQL errors: Forbidden") == 1
+
+
+def test_a_failed_graphql_read_does_not_rearm_the_refusal_warning(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A 5xx in between says nothing about the query, so it is not an answer."""
+    transport = FixtureTransport(responses={"/frosty/graphql": FROSTY_REFUSED})
+    client = fixture_client(transport)
+    with caplog.at_level(logging.WARNING):
+        client.fetch_usage()
+        transport.responses["/frosty/graphql"] = HttpResponse(502, b"{}")
+        client.fetch_usage()
+        transport.responses["/frosty/graphql"] = FROSTY_REFUSED
+        client.fetch_usage()
+
+    assert _warnings_about(caplog, "/frosty/graphql returned GraphQL errors") == 1
+
+
+def test_a_grant_without_eva_warns_once_not_every_poll(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Auth0 leaves me:eva out of the grant for an account without the permission.
+
+    Re-issuing the token asks for the same scope and gets the same grant, so the
+    403 comes back on every poll; it is reported once.
+    """
+    transport = FixtureTransport(responses={EVA_LATEST_SESSION_PATH: EVA_DENIED})
+    client = fixture_client(transport)
+    with caplog.at_level(logging.DEBUG, logger="custom_components.sp_group"):
+        for _ in range(3):
+            assert client.fetch_usage().ev_session is None
+
+    assert _warnings_about(caplog, "grant does not cover Eva") == 1
+    assert _debug_lines_about(caplog, "grant does not cover Eva") == 2
+
+
+def test_an_eva_answer_between_denials_rearms_the_warning(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    transport = FixtureTransport(responses={EVA_LATEST_SESSION_PATH: EVA_DENIED})
+    client = fixture_client(transport)
+    with caplog.at_level(logging.WARNING):
+        client.fetch_usage()
+        transport.responses[EVA_LATEST_SESSION_PATH] = HttpResponse(200, b"{}")
+        client.fetch_usage()
+        transport.responses[EVA_LATEST_SESSION_PATH] = EVA_DENIED
+        client.fetch_usage()
+
+    assert _warnings_about(caplog, "grant does not cover Eva") == 2
+
+
+def test_each_setup_reports_a_standing_refusal_once() -> None:
+    """The record is the client's, so a reload or a restart warns again."""
+    transport = FixtureTransport(
+        responses={
+            "/frosty/graphql": FROSTY_REFUSED,
+            EVA_LATEST_SESSION_PATH: EVA_DENIED,
+        }
+    )
+    first = fixture_client(transport)
+    first.fetch_usage()
+    second = fixture_client(transport)
+
+    assert first._refusals
+    assert second._refusals == {}
+
+
 def test_tariff_consumption_uses_the_newest_period_not_the_last_row() -> None:
     """A host that lists periods newest-first must not price the oldest one."""
 

@@ -37,6 +37,7 @@ from .const import (
     ACCEPT_LANGUAGE,
     AMI_DAILY_MONTHS,
     AMI_DATE_FORMAT,
+    AMI_FALLBACK_MAX_AGE,
     AMI_GROUPED_BY_DAILY,
     AMI_GROUPED_BY_HALF_HOUR,
     AMI_HALF_HOUR_DAYS,
@@ -993,18 +994,6 @@ def _graphql_error(body: object) -> str:
     )
 
 
-def _log_graphql_errors(path: str, body: object) -> None:
-    """Warn about a GraphQL read that answered 200 with errors in the envelope.
-
-    A warning, not a debug line, for the same reason the optional-read 4xx
-    split exists: the read feeds entities, so a server-side rejection takes
-    them away and only the log says so.
-    """
-    detail = _graphql_error(body)
-    if detail:
-        _LOGGER.warning("%s returned GraphQL errors: %s", path, detail)
-
-
 def _graphql_data(body: object) -> dict[str, object] | None:
     if not isinstance(body, dict):
         return None
@@ -1434,6 +1423,17 @@ class SpGroupClient:
         # the map needs the lock the session exchange uses.
         self._reads_lock = threading.Lock()
         self._read_failures: dict[str, str] = {}
+        # The refusals already reported at warning, by read, with what each one
+        # said. Frosty answers "Unauthorized" for a premise with no Tengah coil
+        # and Eva a 403 for a grant without me:eva, and both say so on every
+        # poll for as long as the account stays that way: one warning per setup
+        # says it, a warning every 30 minutes only buries the rest of the log.
+        self._refusals: dict[str, str] = {}
+        # The last good answer of each AMI feed, by premise and grouping, with
+        # when it was read: what a failed read of that feed stands on.
+        self._ami_answers: dict[
+            tuple[str, str], tuple[datetime, tuple[PeriodReading, ...]]
+        ] = {}
 
     @property
     def clock(self) -> Clock:
@@ -1467,6 +1467,52 @@ class SpGroupClient:
     def _note_read_failure(self, label: str, reason: str) -> None:
         with self._reads_lock:
             self._read_failures[label] = reason
+
+    def _report_refusal(
+        self, read: str, detail: str, message: str, *args: object
+    ) -> None:
+        """Warn the first time ``read`` is refused with ``detail``, debug after.
+
+        A refusal that keeps its wording is the account's steady state, not news,
+        so it is logged at warning once and at debug on the polls after it. A new
+        wording, or the same one after the read has succeeded in between, warns
+        again.
+        """
+        with self._reads_lock:
+            repeated = self._refusals.get(read) == detail
+            self._refusals[read] = detail
+        _LOGGER.log(logging.DEBUG if repeated else logging.WARNING, message, *args)
+
+    def _clear_refusal(self, read: str) -> None:
+        """``read`` was answered, so its next refusal is news again."""
+        with self._reads_lock:
+            self._refusals.pop(read, None)
+
+    def _check_graphql_errors(self, path: str, body: object) -> None:
+        """Report a GraphQL read that answered 200 with errors in the envelope.
+
+        A warning, not a debug line, for the same reason the optional-read 4xx
+        split exists: the read feeds entities, so a server-side rejection takes
+        them away and only the log says so. It is reported once per wording
+        (``_report_refusal``): Frosty refuses ``getPairedFCUs`` with
+        "Unauthorized" for a premise with no paired Tengah coil, which is most
+        premises, and does so on every poll.
+        """
+        if body is None:
+            # The read failed before it got an envelope, and that is logged
+            # where it failed; it says nothing about whether the query is allowed.
+            return
+        detail = _graphql_error(body)
+        if not detail:
+            self._clear_refusal(path)
+            return
+        self._report_refusal(
+            path,
+            detail,
+            "%s returned GraphQL errors: %s (repeats are logged at debug)",
+            path,
+            detail,
+        )
 
     def login(self, username: str, password: str) -> Session:
         _begin_login_attempt(username, self._clock)
@@ -1866,7 +1912,7 @@ class SpGroupClient:
             ami_future = pool.submit(self._fetch_ami, session, info)
             meter_reading, meter_registers = meter_future.result()
             ppms_credit, ppms_updated_at = ppms_future.result()
-            ami_hourly, ami_daily = ami_future.result()
+            ami_hourly, ami_daily, ami_read_failed = ami_future.result()
         if (
             electricity is None
             and water is None
@@ -1900,6 +1946,7 @@ class SpGroupClient:
             ppms_updated_at=ppms_updated_at,
             ami_hourly=ami_hourly,
             ami_daily=ami_daily,
+            ami_read_failed=ami_read_failed,
             bills=bills,
             amount_due=amount_due,
             meter_registers=meter_registers,
@@ -1971,7 +2018,7 @@ class SpGroupClient:
         body = self._optional_post(
             session, GREENUP_GRAPHQL_PATH, {"query": GREENUP_ACCOUNT_QUERY}
         )
-        _log_graphql_errors(GREENUP_GRAPHQL_PATH, body)
+        self._check_graphql_errors(GREENUP_GRAPHQL_PATH, body)
         return _parse_greenup(body)
 
     def _fetch_ev_wallet(self, session: Session) -> EvWalletInfo | None:
@@ -2011,13 +2058,21 @@ class SpGroupClient:
             # A 403 the host attributes to the grant, not to an enrollment. The
             # generic optional-read line files it as the expected "not signed up"
             # case, which hides the one thing worth acting on: a token that will
-            # never carry these reads until it is re-issued with the scope.
-            _LOGGER.warning(
+            # never carry these reads until it is re-issued with the scope. Auth0
+            # leaves me:eva out of the grant for an account it does not give the
+            # permission to, however often the token is re-issued, so the line is
+            # a warning once and a debug line on every poll after.
+            self._report_refusal(
+                EVA_LATEST_SESSION_PATH,
+                SCOPE_NOT_FOUND,
                 "optional read %s returned HTTP 403: the session's grant does not "
-                "cover Eva, so the Eva sensors stay unset",
+                "cover Eva, so the Eva sensors stay unset (repeats are logged at "
+                "debug)",
                 EVA_LATEST_SESSION_PATH,
             )
             return None, None, None
+        if response.status < 400:
+            self._clear_refusal(EVA_LATEST_SESSION_PATH)
         label = _read_label("GET", eva_url)
         ev_session = _parse_ev_session(
             _optional_json(
@@ -2045,7 +2100,7 @@ class SpGroupClient:
                 "variables": {"utilityAccountNumber": account_number},
             },
         )
-        _log_graphql_errors(FROSTY_GRAPHQL_PATH, body)
+        self._check_graphql_errors(FROSTY_GRAPHQL_PATH, body)
         paired = _parse_paired_fcus(body)
         if not paired:
             return ()
@@ -2129,9 +2184,10 @@ class SpGroupClient:
 
     def _fetch_ami(
         self, session: Session, premise: PremiseInfo
-    ) -> tuple[tuple[PeriodReading, ...], tuple[PeriodReading, ...]]:
+    ) -> tuple[tuple[PeriodReading, ...], tuple[PeriodReading, ...], bool]:
+        """Both AMI feeds, and whether either failed with nothing to stand on."""
         if premise.ami_elec is not True:
-            return (), ()
+            return (), (), False
         now = self._clock.now()
         day_end = now.replace(hour=23, minute=59, second=59, microsecond=0)
         day_start = (now - timedelta(days=AMI_HALF_HOUR_DAYS - 1)).replace(
@@ -2145,13 +2201,17 @@ class SpGroupClient:
         month_start = now.replace(
             year=year, month=month, day=1, hour=0, minute=0, second=0, microsecond=0
         )
-        hourly = self._fetch_ami_range(
+        hourly, hourly_failed = self._fetch_ami_range(
             session, premise.id, AMI_GROUPED_BY_HALF_HOUR, day_start, day_end
         )
-        daily = self._fetch_ami_range(
+        daily, daily_failed = self._fetch_ami_range(
             session, premise.id, AMI_GROUPED_BY_DAILY, month_start, day_end
         )
-        return _drop_future(hourly, now), _drop_future(daily, now)
+        return (
+            _drop_future(hourly, now),
+            _drop_future(daily, now),
+            hourly_failed or daily_failed,
+        )
 
     def _fetch_ami_range(
         self,
@@ -2160,7 +2220,13 @@ class SpGroupClient:
         grouped_by: str,
         start: datetime,
         end: datetime,
-    ) -> tuple[PeriodReading, ...]:
+    ) -> tuple[tuple[PeriodReading, ...], bool]:
+        """One feed's slots, and whether the read failed with nothing to stand on.
+
+        A failed read hands back the slots the last good read of the same feed
+        returned (``_previous_ami_answer``), so only a failure with no such
+        answer, or one too old to use, is reported as a failure.
+        """
         payload = {
             "premise_id": premise_id,
             "start": _ami_stamp(start),
@@ -2168,8 +2234,19 @@ class SpGroupClient:
             "grouped_by": grouped_by,
             "utility_type": "electric",
         }
-        body = self._optional_post(
-            session, JARVIS_AMI_PATH, payload, timeout=HTTP_TIMEOUT_SECONDS
+        headers = dict(self._auth_headers(session))
+        headers["Content-Type"] = CONTENT_TYPE_JSON
+        url = f"{B2C_HOST}{JARVIS_AMI_PATH}"
+        label = _read_label("POST", url)
+        response = self._optional_response(
+            "POST", url, headers, payload, HTTP_TIMEOUT_SECONDS
+        )
+        body = (
+            None
+            if response is None
+            else _optional_json(
+                response, label, lambda reason: self._note_read_failure(label, reason)
+            )
         )
         periods = _parse_ami_rows(body)
         if body is not None and not periods:
@@ -2179,12 +2256,55 @@ class SpGroupClient:
             # updating with every sensor still reading normally.
             _LOGGER.warning(
                 "%s read a body with no usable %s slots for %s to %s",
-                _read_label("POST", f"{B2C_HOST}{JARVIS_AMI_PATH}"),
+                label,
                 grouped_by,
                 _ami_stamp(start),
                 _ami_stamp(end),
             )
-        return periods
+        feed = (premise_id, grouped_by)
+        if periods:
+            with self._reads_lock:
+                self._ami_answers[feed] = (self._clock.now(), periods)
+            return periods, False
+        if response is not None and (
+            response.status in OPTIONAL_ABSENT_STATUSES or _scope_denied(response)
+        ):
+            # The host says there is nothing to read, which is an answer.
+            return periods, False
+        previous = self._previous_ami_answer(feed, start, label)
+        if previous is None:
+            return (), True
+        return previous, False
+
+    def _previous_ami_answer(
+        self, feed: tuple[str, str], start: datetime, label: str
+    ) -> tuple[PeriodReading, ...] | None:
+        """The slots the last good read of ``feed`` returned, for a failed read.
+
+        The read already logged why it failed. Its slots are history, so they
+        are still true: standing on them for one poll keeps today's total, the
+        last slot, and the cumulative sensor where they were instead of dropping
+        them to unknown until the next poll reads the feed again. The slots
+        before ``start`` have left the window this poll asked for and are not
+        handed back, and an answer older than AMI_FALLBACK_MAX_AGE is not used:
+        None means there is nothing to stand on.
+        """
+        with self._reads_lock:
+            previous = self._ami_answers.get(feed)
+        if previous is None:
+            return None
+        read_at, periods = previous
+        if self._clock.now() - read_at > AMI_FALLBACK_MAX_AGE:
+            return None
+        kept = tuple(item for item in periods if item.start >= start)
+        _LOGGER.debug(
+            "%s %s read failed; keeping the %d slots read at %s",
+            label,
+            feed[1],
+            len(kept),
+            read_at.isoformat(),
+        )
+        return kept
 
     def _raise_auth_if_denied(self, response: HttpResponse, label: str) -> None:
         if response.status < 400:
