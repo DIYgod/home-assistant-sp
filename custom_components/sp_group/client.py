@@ -993,18 +993,6 @@ def _graphql_error(body: object) -> str:
     )
 
 
-def _log_graphql_errors(path: str, body: object) -> None:
-    """Warn about a GraphQL read that answered 200 with errors in the envelope.
-
-    A warning, not a debug line, for the same reason the optional-read 4xx
-    split exists: the read feeds entities, so a server-side rejection takes
-    them away and only the log says so.
-    """
-    detail = _graphql_error(body)
-    if detail:
-        _LOGGER.warning("%s returned GraphQL errors: %s", path, detail)
-
-
 def _graphql_data(body: object) -> dict[str, object] | None:
     if not isinstance(body, dict):
         return None
@@ -1434,6 +1422,12 @@ class SpGroupClient:
         # the map needs the lock the session exchange uses.
         self._reads_lock = threading.Lock()
         self._read_failures: dict[str, str] = {}
+        # The refusals already reported at warning, by read, with what each one
+        # said. Frosty answers "Unauthorized" for a premise with no Tengah coil
+        # and Eva a 403 for a grant without me:eva, and both say so on every
+        # poll for as long as the account stays that way: one warning per setup
+        # says it, a warning every 30 minutes only buries the rest of the log.
+        self._refusals: dict[str, str] = {}
 
     @property
     def clock(self) -> Clock:
@@ -1467,6 +1461,52 @@ class SpGroupClient:
     def _note_read_failure(self, label: str, reason: str) -> None:
         with self._reads_lock:
             self._read_failures[label] = reason
+
+    def _report_refusal(
+        self, read: str, detail: str, message: str, *args: object
+    ) -> None:
+        """Warn the first time ``read`` is refused with ``detail``, debug after.
+
+        A refusal that keeps its wording is the account's steady state, not news,
+        so it is logged at warning once and at debug on the polls after it. A new
+        wording, or the same one after the read has succeeded in between, warns
+        again.
+        """
+        with self._reads_lock:
+            repeated = self._refusals.get(read) == detail
+            self._refusals[read] = detail
+        _LOGGER.log(logging.DEBUG if repeated else logging.WARNING, message, *args)
+
+    def _clear_refusal(self, read: str) -> None:
+        """``read`` was answered, so its next refusal is news again."""
+        with self._reads_lock:
+            self._refusals.pop(read, None)
+
+    def _check_graphql_errors(self, path: str, body: object) -> None:
+        """Report a GraphQL read that answered 200 with errors in the envelope.
+
+        A warning, not a debug line, for the same reason the optional-read 4xx
+        split exists: the read feeds entities, so a server-side rejection takes
+        them away and only the log says so. It is reported once per wording
+        (``_report_refusal``): Frosty refuses ``getPairedFCUs`` with
+        "Unauthorized" for a premise with no paired Tengah coil, which is most
+        premises, and does so on every poll.
+        """
+        if body is None:
+            # The read failed before it got an envelope, and that is logged
+            # where it failed; it says nothing about whether the query is allowed.
+            return
+        detail = _graphql_error(body)
+        if not detail:
+            self._clear_refusal(path)
+            return
+        self._report_refusal(
+            path,
+            detail,
+            "%s returned GraphQL errors: %s (repeats are logged at debug)",
+            path,
+            detail,
+        )
 
     def login(self, username: str, password: str) -> Session:
         _begin_login_attempt(username, self._clock)
@@ -1971,7 +2011,7 @@ class SpGroupClient:
         body = self._optional_post(
             session, GREENUP_GRAPHQL_PATH, {"query": GREENUP_ACCOUNT_QUERY}
         )
-        _log_graphql_errors(GREENUP_GRAPHQL_PATH, body)
+        self._check_graphql_errors(GREENUP_GRAPHQL_PATH, body)
         return _parse_greenup(body)
 
     def _fetch_ev_wallet(self, session: Session) -> EvWalletInfo | None:
@@ -2011,13 +2051,21 @@ class SpGroupClient:
             # A 403 the host attributes to the grant, not to an enrollment. The
             # generic optional-read line files it as the expected "not signed up"
             # case, which hides the one thing worth acting on: a token that will
-            # never carry these reads until it is re-issued with the scope.
-            _LOGGER.warning(
+            # never carry these reads until it is re-issued with the scope. Auth0
+            # leaves me:eva out of the grant for an account it does not give the
+            # permission to, however often the token is re-issued, so the line is
+            # a warning once and a debug line on every poll after.
+            self._report_refusal(
+                EVA_LATEST_SESSION_PATH,
+                SCOPE_NOT_FOUND,
                 "optional read %s returned HTTP 403: the session's grant does not "
-                "cover Eva, so the Eva sensors stay unset",
+                "cover Eva, so the Eva sensors stay unset (repeats are logged at "
+                "debug)",
                 EVA_LATEST_SESSION_PATH,
             )
             return None, None, None
+        if response.status < 400:
+            self._clear_refusal(EVA_LATEST_SESSION_PATH)
         label = _read_label("GET", eva_url)
         ev_session = _parse_ev_session(
             _optional_json(
@@ -2045,7 +2093,7 @@ class SpGroupClient:
                 "variables": {"utilityAccountNumber": account_number},
             },
         )
-        _log_graphql_errors(FROSTY_GRAPHQL_PATH, body)
+        self._check_graphql_errors(FROSTY_GRAPHQL_PATH, body)
         paired = _parse_paired_fcus(body)
         if not paired:
             return ()

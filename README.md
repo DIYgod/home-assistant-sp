@@ -125,13 +125,16 @@ whole update failed. A skipped read that came back with a status other than 404
 is logged with the route and the status, so a sensor that never appears leaves
 a log line naming the call that failed. The two GraphQL reads answer 200 even
 when the query is refused, so their `errors` array is logged the same way; a
-rejected query is not silent. An empty 200 says nothing and is not logged.
+rejected query is not silent. A refusal that comes back with the same wording on
+every poll is logged at warning once per setup and at debug after that: Frosty
+answers `Unauthorized` for a premise without a paired Tengah coil. An empty
+200 says nothing and is not logged.
 
 Then optional reads (8s HTTP timeout each). 4xx or empty payloads skip the matching sensor:
 
 - `POST /1up/authenticated/graphql` GreenUP account
 - `GET /tyche/v1/wallet-summary`
-- `GET /eva/v1/sessions/latest`, `/eva/v2/order/receipts`, `/eva/v1/order/unpaid`. A 403 `scope_not_found` on the session call skips the rest of Eva
+- `GET /eva/v1/sessions/latest`, `/eva/v2/order/receipts`, `/eva/v1/order/unpaid`. A 403 `scope_not_found` on the session call skips the rest of Eva and is logged at warning once per setup: Auth0 leaves `me:eva` out of the grant for an account without that permission, however often the token is re-issued
 - `GET /notifications/v1/notifications` unread count only (bodies are not stored)
 - `GET /skalbox/b2c/account/v1/retrieveBillPreferences`
 - `POST /frosty/graphql` paired FCUs, then `/frosty/fcu_status` per `thingName`, for the first 8 coils
@@ -162,6 +165,7 @@ Bill pay, GIRO setup, UniDollar pay, add card, start/stop EV charge, meter-readi
 - **No Energy statistics:** wait for the first poll, hard-refresh Energy settings, then pick **SP Group electricity** (`sp_group:{premise_id}_electricity`), not a sensor.
 - **Missing optional sensor after upgrade:** wait for the next poll. New keys are added without a reload.
 - **Entities unavailable after a failed poll:** the config entry diagnostics carry `last_error` (why the poll gave up), `last_poll_ms` and `last_success` (how long it took and when it last worked), and `failed_reads` (the optional read that took a sensor down, keyed by the read that failed). Set `logger: custom_components.sp_group` to debug for the per-request status and duration of each poll.
+- **`/frosty/graphql returned GraphQL errors: Unauthorized` or `the session's grant does not cover Eva`:** the premise has no paired Tengah coil, or the account has no SP EV charging permission. Signing in again asks for the same scopes and gets the same answer, so there is nothing to fix; each is logged once per setup.
 - **An optional sensor is missing and no error was logged:** the poll reports 404 for a read the account is not enrolled for, and a 403 for a scope its grant does not cover. Both are the steady state and appear in no field; `failed_reads` is empty.
 
 ## Examples
